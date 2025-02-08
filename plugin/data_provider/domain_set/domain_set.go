@@ -22,10 +22,15 @@ package domain_set
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/domain"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
-	"os"
 )
 
 const PluginType = "domain_set"
@@ -43,9 +48,16 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 type Args struct {
-	Exps  []string `yaml:"exps"`
-	Sets  []string `yaml:"sets"`
-	Files []string `yaml:"files"`
+	Exps        []string     `yaml:"exps"`
+	Sets        []string     `yaml:"sets"`
+	Files       []string     `yaml:"files"`
+	RemoteFiles []RemoteFile `yaml:"remote_files"`
+}
+
+type RemoteFile struct {
+	URL      string `yaml:"url"`
+	Path     string `yaml:"path"`
+	Interval int    `yaml:"interval"` // in seconds
 }
 
 var _ data_provider.DomainMatcherProvider = (*DomainSet)(nil)
@@ -66,6 +78,18 @@ func NewDomainSet(bp *coremain.BP, args *Args) (*DomainSet, error) {
 	if err := LoadExpsAndFiles(args.Exps, args.Files, m); err != nil {
 		return nil, err
 	}
+
+	// Handle remote files
+	for _, rf := range args.RemoteFiles {
+		if err := LoadRemoteFile(rf, m); err != nil {
+			return nil, fmt.Errorf("failed to load remote file %s: %w", rf.URL, err)
+		}
+		// Start background update goroutine if interval is set
+		if rf.Interval > 0 {
+			go updateRemoteFile(rf, m)
+		}
+	}
+
 	if m.Len() > 0 {
 		ds.mg = append(ds.mg, m)
 	}
@@ -120,5 +144,78 @@ func LoadFile(f string, m *domain.MixMatcher[struct{}]) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func LoadRemoteFile(rf RemoteFile, m *domain.MixMatcher[struct{}]) error {
+	// Create directory if it doesn't exist
+	if dir := filepath.Dir(rf.Path); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Download file if it doesn't exist
+	if _, err := os.Stat(rf.Path); os.IsNotExist(err) {
+		if err := downloadFile(rf.URL, rf.Path); err != nil {
+			return err
+		}
+	}
+
+	// Load the file first
+	if err := LoadFile(rf.Path, m); err != nil {
+		return err
+	}
+
+	// Then update it once to ensure we have the latest version
+	if err := downloadFile(rf.URL, rf.Path); err != nil {
+		return fmt.Errorf("failed to update remote file: %w", err)
+	}
+
+	// Reload with updated content
+	return LoadFile(rf.Path, m)
+}
+
+func updateRemoteFile(rf RemoteFile, m *domain.MixMatcher[struct{}]) {
+	ticker := time.NewTicker(time.Duration(rf.Interval) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Create a new matcher for the updated rules
+		newMatcher := domain.NewDomainMixMatcher()
+		if err := downloadFile(rf.URL, rf.Path); err != nil {
+			continue
+		}
+		if err := LoadFile(rf.Path, newMatcher); err != nil {
+			continue
+		}
+
+		// Replace the old matcher's internal data with the new one
+		*m = *newMatcher
+	}
+}
+
+func downloadFile(url, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
 	return nil
 }

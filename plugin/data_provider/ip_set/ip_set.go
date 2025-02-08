@@ -22,12 +22,17 @@ package ip_set
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"net/http"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/matcher/netlist"
 	"github.com/IrineSistiana/mosdns/v5/plugin/data_provider"
-	"net/netip"
-	"os"
-	"strings"
 )
 
 const PluginType = "ip_set"
@@ -41,9 +46,16 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 type Args struct {
-	IPs   []string `yaml:"ips"`
-	Sets  []string `yaml:"sets"`
-	Files []string `yaml:"files"`
+	IPs         []string     `yaml:"ips"`
+	Sets        []string     `yaml:"sets"`
+	Files       []string     `yaml:"files"`
+	RemoteFiles []RemoteFile `yaml:"remote_files"`
+}
+
+type RemoteFile struct {
+	URL      string `yaml:"url"`
+	Path     string `yaml:"path"`
+	Interval int    `yaml:"interval"` // in seconds
 }
 
 var _ data_provider.IPMatcherProvider = (*IPSet)(nil)
@@ -63,6 +75,18 @@ func NewIPSet(bp *coremain.BP, args *Args) (*IPSet, error) {
 	if err := LoadFromIPsAndFiles(args.IPs, args.Files, l); err != nil {
 		return nil, err
 	}
+
+	// Handle remote files
+	for _, rf := range args.RemoteFiles {
+		if err := LoadFromRemoteFile(rf, l); err != nil {
+			return nil, fmt.Errorf("failed to load remote file %s: %w", rf.URL, err)
+		}
+		// Start background update goroutine if interval is set
+		if rf.Interval > 0 {
+			go updateRemoteFile(rf, l)
+		}
+	}
+
 	l.Sort()
 	if l.Len() > 0 {
 		p.mg = append(p.mg, l)
@@ -128,6 +152,75 @@ func LoadFromFile(f string, l *netlist.List) error {
 			return err
 		}
 	}
+	return nil
+}
+
+func LoadFromRemoteFile(rf RemoteFile, l *netlist.List) error {
+	// Create directory if it doesn't exist
+	if dir := filepath.Dir(rf.Path); dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Download file if it doesn't exist
+	if _, err := os.Stat(rf.Path); os.IsNotExist(err) {
+		if err := downloadFile(rf.URL, rf.Path); err != nil {
+			return err
+		}
+	}
+
+	// Load the file
+	LoadFromFile(rf.Path, l)
+
+	// Then update it once to ensure we have the latest version
+	if err := downloadFile(rf.URL, rf.Path); err != nil {
+		return err
+	}
+
+	// Reload with updated content
+	return LoadFromFile(rf.Path, l)
+}
+
+func updateRemoteFile(rf RemoteFile, l *netlist.List) {
+	ticker := time.NewTicker(time.Duration(rf.Interval) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		newList := netlist.NewList()
+		if err := downloadFile(rf.URL, rf.Path); err != nil {
+			continue
+		}
+		if err := LoadFromFile(rf.Path, newList); err != nil {
+			continue
+		}
+		newList.Sort()
+		*l = *newList // Replace the old list with the new one
+	}
+}
+
+func downloadFile(url, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
 	return nil
 }
 
